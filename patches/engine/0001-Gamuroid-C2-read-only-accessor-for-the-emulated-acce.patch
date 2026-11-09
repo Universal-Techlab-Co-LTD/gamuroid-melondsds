@@ -1,0 +1,63 @@
+From b96aa467b0ea64d2570e31cd2ff5de4bb73957da Mon Sep 17 00:00:00 2001
+From: thang <thang@local>
+Date: Sat, 7 Nov 2026 05:09:54 +0700
+Subject: [PATCH] Gamuroid C2: read-only accessor for the emulated access
+ point's client state
+
+Adds WifiAP::GetClientStatus() and Wifi::GetAPClientStatus() (0 none,
+1 authenticated, 2 associated; 0 without an access point). Read-only,
+no change to emulation or save states.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/Wifi.cpp | 5 +++++
+ src/Wifi.h   | 4 ++++
+ src/WifiAP.h | 4 ++++
+ 3 files changed, 13 insertions(+)
+
+diff --git a/src/Wifi.cpp b/src/Wifi.cpp
+index 89bdb028..61fd8627 100644
+--- a/src/Wifi.cpp
++++ b/src/Wifi.cpp
+@@ -2470,6 +2470,11 @@ void Wifi::Write(u32 addr, u16 val)
+ }
+ 
+ 
++int Wifi::GetAPClientStatus() const
++{
++    return WifiAP ? WifiAP->GetClientStatus() : 0;
++}
++
+ const u8* Wifi::GetMAC() const
+ {
+     return (u8*)&IOPORT(W_MACAddr0);
+diff --git a/src/Wifi.h b/src/Wifi.h
+index 61d75354..a5785854 100644
+--- a/src/Wifi.h
++++ b/src/Wifi.h
+@@ -173,6 +173,10 @@ public:
+     const u8* GetMAC() const;
+     const u8* GetBSSID() const;
+ 
++    // Gamuroid: association state of the console with the emulated access point,
++    // 0=none 1=authenticated 2=associated; 0 when there is no access point.
++    int GetAPClientStatus() const;
++
+ private:
+     melonDS::NDS& NDS;
+     u8 RAM[0x2000];
+diff --git a/src/WifiAP.h b/src/WifiAP.h
+index 38c9042f..6605a0e4 100644
+--- a/src/WifiAP.h
++++ b/src/WifiAP.h
+@@ -42,6 +42,10 @@ public:
+     int SendPacket(const u8* data, int len);
+     int RecvPacket(u8* data);
+ 
++    // Gamuroid: read-only view of the single client's association state
++    // (0=disconnected 1=authenticated 2=associated). No effect on emulation.
++    int GetClientStatus() const { return ClientStatus; }
++
+ private:
+     Wifi* Client;
+     void* UserData;

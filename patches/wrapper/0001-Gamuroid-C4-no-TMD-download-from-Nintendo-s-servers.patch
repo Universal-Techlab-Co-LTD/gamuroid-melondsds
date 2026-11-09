@@ -1,0 +1,96 @@
+From e1e26b255f9d2103835232f0f9660ddf7863636f Mon Sep 17 00:00:00 2001
+From: thang <thang@local>
+Date: Sat, 7 Nov 2026 05:10:18 +0700
+Subject: [PATCH 1/5] Gamuroid C4: no TMD download from Nintendo's servers
+
+The DSiWare TMD download (and the HTTP helper it uses) is now behind the
+CMake option MELONDSDS_ENABLE_TMD_DOWNLOAD, OFF by default. Without it a
+DSiWare title with no local TMD fails with upstream's existing
+'this build does not support downloading it' error; no request is made
+and the update-server URL is not in the binary.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/libretro/CMakeLists.txt     | 10 ++++++++--
+ src/libretro/config/console.cpp |  9 ++++++++-
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/src/libretro/CMakeLists.txt b/src/libretro/CMakeLists.txt
+index d8b10620..e2f9db52 100644
+--- a/src/libretro/CMakeLists.txt
++++ b/src/libretro/CMakeLists.txt
+@@ -104,8 +104,6 @@ add_library(melondsds_libretro ${LIBRARY_TYPE}
+     retro/dirent.hpp
+     retro/file.cpp
+     retro/file.hpp
+-    retro/http.cpp
+-    retro/http.hpp
+     retro/info.cpp
+     retro/info.hpp
+     retro/microphone.cpp
+@@ -182,6 +180,14 @@ if (ENABLE_THREADED_RENDERER)
+     target_compile_definitions(melondsds_libretro PUBLIC ENABLE_THREADED_RENDERER HAVE_THREADED_RENDERER)
+ endif ()
+ 
++# Downloading a DSiWare title's TMD from Nintendo's update server.
++# Off by default: without it, a DSiWare title needs a TMD in the system directory.
++option(MELONDSDS_ENABLE_TMD_DOWNLOAD "Download missing DSiWare title metadata from Nintendo's servers." OFF)
++if (MELONDSDS_ENABLE_TMD_DOWNLOAD)
++    target_sources(melondsds_libretro PRIVATE retro/http.cpp retro/http.hpp)
++    target_compile_definitions(melondsds_libretro PRIVATE MELONDSDS_ENABLE_TMD_DOWNLOAD)
++endif ()
++
+ if (HAVE_NETWORKING)
+     target_sources(melondsds_libretro PRIVATE
+         ${melonDS_SOURCE_DIR}/src/net/Net_Slirp.cpp
+diff --git a/src/libretro/config/console.cpp b/src/libretro/config/console.cpp
+index 73b7e248..393de4b8 100644
+--- a/src/libretro/config/console.cpp
++++ b/src/libretro/config/console.cpp
+@@ -43,7 +43,9 @@
+ #include "exceptions.hpp"
+ #include "format.hpp"
+ #include "retro/file.hpp"
++#ifdef MELONDSDS_ENABLE_TMD_DOWNLOAD
+ #include "retro/http.hpp"
++#endif
+ #include "retro/info.hpp"
+ #include "types.hpp"
+ 
+@@ -95,8 +97,10 @@ namespace MelonDsDs {
+     static void GetTmdPath(const retro::GameInfo &nds_info, std::span<char> buffer);
+     static optional<TitleMetadata> GetCachedTmd(string_view tmdPath) noexcept;
+     static bool ValidateTmd(const TitleMetadata &tmd) noexcept;
++#ifdef MELONDSDS_ENABLE_TMD_DOWNLOAD
+     static optional<TitleMetadata> DownloadTmd(const NDSHeader& header, string_view tmdPath) noexcept;
+     static bool CacheTmd(string_view tmd_path, std::span<const std::byte> tmd) noexcept;
++#endif
+     static void ImportDsiwareSaveData(NANDMount& nand, const retro::GameInfo& nds_info, const NDSHeader& header, int type) noexcept;
+     static optional<Firmware> LoadFirmware(const string& firmwarePath) noexcept;
+     static bool LoadBios(const string_view& name, BiosType type, std::span<uint8_t> buffer) noexcept;
+@@ -830,7 +834,7 @@ void MelonDsDs::InstallDsiware(NANDMount& mount, const retro::GameInfo& nds_info
+         if (!tmd) {
+             // If the TMD isn't available locally...
+ 
+-#ifdef HAVE_NETWORKING
++#if defined(HAVE_NETWORKING) && defined(MELONDSDS_ENABLE_TMD_DOWNLOAD)
+             if (tmd = DownloadTmd(header, tmd_path); !tmd) {
+                 // ...then download it and save it to disk. If that didn't work...
+                 throw missing_metadata_exception("Cannot get title metadata for installation");
+@@ -922,6 +926,8 @@ static bool MelonDsDs::ValidateTmd(const TitleMetadata &tmd) noexcept {
+     return true;
+ }
+ 
++#ifdef MELONDSDS_ENABLE_TMD_DOWNLOAD
++// Gamuroid builds leave this off (scripts/build_ios.sh): the core never contacts Nintendo's servers.
+ static optional<TitleMetadata> MelonDsDs::DownloadTmd(const NDSHeader &header, string_view tmdPath) noexcept {
+     ZoneScopedN(TracyFunction);
+     auto url = fmt::format(
+@@ -1012,6 +1018,7 @@ static bool MelonDsDs::CacheTmd(string_view tmd_path, std::span<const std::byte>
+         return false;
+     }
+ }
++#endif // MELONDSDS_ENABLE_TMD_DOWNLOAD
+ 
+ static void MelonDsDs::ImportDsiwareSaveData(NANDMount& nand, const retro::GameInfo& nds_info, const NDSHeader& header, int type) noexcept {
+     ZoneScopedN(TracyFunction);

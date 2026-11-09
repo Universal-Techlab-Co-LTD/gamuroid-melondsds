@@ -1,0 +1,133 @@
+From b219e53abff0a4ae9b2e8710098fce41c5ed0f47 Mon Sep 17 00:00:00 2001
+From: thang <thang@local>
+Date: Sat, 7 Nov 2026 05:17:49 +0700
+Subject: [PATCH 4/5] Gamuroid C2: keep the online-state protocol free of
+ emulator includes
+
+retro_run reads the engine's access point state and hands the code to
+NetStateUpdate(), so net_state.cpp can be unit-tested on the host
+(tests/net_state_test.cpp in the build workspace).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/libretro/gamuroid/net_state.cpp | 37 ++++++++++-------------------
+ src/libretro/gamuroid/net_state.hpp | 12 +++++-----
+ src/libretro/libretro.cpp           |  8 ++++++-
+ 3 files changed, 26 insertions(+), 31 deletions(-)
+
+diff --git a/src/libretro/gamuroid/net_state.cpp b/src/libretro/gamuroid/net_state.cpp
+index cf385d6d..37b2a7be 100644
+--- a/src/libretro/gamuroid/net_state.cpp
++++ b/src/libretro/gamuroid/net_state.cpp
+@@ -20,10 +20,6 @@
+ 
+ #include <atomic>
+ 
+-#include <NDS.h>
+-
+-#include "environment.hpp"
+-
+ namespace {
+     using Listener = void (*)(int);
+ 
+@@ -43,19 +39,6 @@ namespace {
+         }
+     }
+ 
+-    int ReadCode(const melonDS::NDS* nds) noexcept {
+-        if (!nds) {
+-            return 0;
+-        }
+-
+-        int code = nds->Wifi.GetAPClientStatus();
+-        if (code < 0 || code > 2) {
+-            // The access point only knows these three states; anything else counts as offline.
+-            return 0;
+-        }
+-
+-        return code;
+-    }
+ }
+ 
+ void MelonDsDs::gamuroid::NetStateSessionBegin() noexcept {
+@@ -63,21 +46,27 @@ void MelonDsDs::gamuroid::NetStateSessionBegin() noexcept {
+     SessionActive = true;
+ }
+ 
+-void MelonDsDs::gamuroid::NetStateTick(const melonDS::NDS* nds) noexcept {
++bool MelonDsDs::gamuroid::NetStateUpdate(int code) noexcept {
+     if (!SessionActive) {
+-        return;
++        return false;
+     }
+ 
+-    int code = ReadCode(nds);
+-    if (code != LastReported.load(std::memory_order_acquire)) {
+-        retro::info("Online state changed to {}", code);
+-        Report(code);
++    if (code < 0 || code > 2) {
++        // The access point only knows these three states; anything else counts as offline.
++        code = 0;
+     }
++
++    if (code == LastReported.load(std::memory_order_acquire)) {
++        return false;
++    }
++
++    Report(code);
++    return true;
+ }
+ 
+ void MelonDsDs::gamuroid::NetStateSessionEnd() noexcept {
+     if (SessionActive && LastReported.load(std::memory_order_acquire) != 0) {
+-        retro::info("Session ended while online; reporting offline");
++        // The session ended online; the frontend must not keep thinking it is
+         Report(0);
+     }
+ 
+diff --git a/src/libretro/gamuroid/net_state.hpp b/src/libretro/gamuroid/net_state.hpp
+index ebe16b54..48676a61 100644
+--- a/src/libretro/gamuroid/net_state.hpp
++++ b/src/libretro/gamuroid/net_state.hpp
+@@ -31,16 +31,16 @@
+ // The listener runs on the thread that runs retro_run (or retro_unload_game),
+ // only when the code changes, and must not call back into the core.
+ 
+-namespace melonDS {
+-    class NDS;
+-}
+-
++// This file and net_state.cpp have no dependency on the emulator,
++// so the protocol can be unit-tested on the host; libretro.cpp feeds in the engine's state.
+ namespace MelonDsDs::gamuroid {
+     /// Called at retro_load_game: the new session starts offline, silently.
+     void NetStateSessionBegin() noexcept;
+ 
+-    /// Called once per retro_run, after the frame: reports a changed code.
+-    void NetStateTick(const melonDS::NDS* nds) noexcept;
++    /// Called once per retro_run, after the frame, with the access point's client state.
++    /// Calls the listener if the code changed; returns true if it did.
++    /// Codes outside 0..2 count as 0.
++    bool NetStateUpdate(int code) noexcept;
+ 
+     /// Called at retro_unload_game: reports 0 if the session ended online,
+     /// then stays quiet until the next session begins.
+diff --git a/src/libretro/libretro.cpp b/src/libretro/libretro.cpp
+index 7cb75d4b..f61b0a26 100644
+--- a/src/libretro/libretro.cpp
++++ b/src/libretro/libretro.cpp
+@@ -117,7 +117,13 @@ PUBLIC_SYMBOL [[gnu::hot]] void retro_run(void) {
+     {
+         ZoneScopedN(TracyFunction);
+         MelonDsDs::Core.Run();
+-        MelonDsDs::gamuroid::NetStateTick(MelonDsDs::Core.GetConsole());
++
++        // Gamuroid P2: report the console's online state when it changes
++        const melonDS::NDS* console = MelonDsDs::Core.GetConsole();
++        int netState = console ? console->Wifi.GetAPClientStatus() : 0;
++        if (MelonDsDs::gamuroid::NetStateUpdate(netState)) {
++            retro::info("Online state changed to {}", netState);
++        }
+     }
+     FrameMark;
+ }

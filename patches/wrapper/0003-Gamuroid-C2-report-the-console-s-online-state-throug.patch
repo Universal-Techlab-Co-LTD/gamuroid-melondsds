@@ -1,0 +1,259 @@
+From 756a9034821f0e025fa38c6339d56866861bcf63 Mon Sep 17 00:00:00 2001
+From: thang <thang@local>
+Date: Sat, 7 Nov 2026 05:11:33 +0700
+Subject: [PATCH 3/5] Gamuroid C2: report the console's online state through C
+ exports
+
+New exports gamuroid_net_state_get() and gamuroid_net_state_listen(fn).
+Once per retro_run the core reads the emulated access point's client
+state (engine accessor) and calls the listener only when the code
+changes (0 none, 1 authenticated, 2 associated). Each load starts at 0;
+unload reports 0 if the session ended online and then stays quiet;
+deinit forgets the listener. No core option and no SET_VARIABLE side
+channel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/libretro/CMakeLists.txt         |   2 +
+ src/libretro/gamuroid/net_state.cpp | 100 ++++++++++++++++++++++++++++
+ src/libretro/gamuroid/net_state.hpp |  58 ++++++++++++++++
+ src/libretro/libretro.cpp           |   6 ++
+ 4 files changed, 166 insertions(+)
+ create mode 100644 src/libretro/gamuroid/net_state.cpp
+ create mode 100644 src/libretro/gamuroid/net_state.hpp
+
+diff --git a/src/libretro/CMakeLists.txt b/src/libretro/CMakeLists.txt
+index e2f9db52..6756af33 100644
+--- a/src/libretro/CMakeLists.txt
++++ b/src/libretro/CMakeLists.txt
+@@ -56,6 +56,8 @@ add_library(melondsds_libretro ${LIBRARY_TYPE}
+     exceptions.hpp
+     format.cpp
+     format.hpp
++    gamuroid/net_state.cpp
++    gamuroid/net_state.hpp
+     glsym_private.cpp
+     glsym_private.h
+     info.cpp
+diff --git a/src/libretro/gamuroid/net_state.cpp b/src/libretro/gamuroid/net_state.cpp
+new file mode 100644
+index 00000000..cf385d6d
+--- /dev/null
++++ b/src/libretro/gamuroid/net_state.cpp
+@@ -0,0 +1,100 @@
++/*
++    Copyright 2026 Gamuroid contributors
++
++    This file is part of a modified version of melonDS DS.
++
++    melonDS DS is free software: you can redistribute it and/or modify it under
++    the terms of the GNU General Public License as published by the Free
++    Software Foundation, either version 3 of the License, or (at your option)
++    any later version.
++
++    melonDS DS is distributed in the hope that it will be useful, but WITHOUT ANY
++    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License along
++    with melonDS DS. If not, see http://www.gnu.org/licenses/.
++*/
++
++#include "net_state.hpp"
++
++#include <atomic>
++
++#include <NDS.h>
++
++#include "environment.hpp"
++
++namespace {
++    using Listener = void (*)(int);
++
++    // Written only on the emulation thread; read from any thread by gamuroid_net_state_get.
++    std::atomic<int> LastReported {0};
++
++    // Set from any thread by gamuroid_net_state_listen.
++    std::atomic<Listener> CurrentListener {nullptr};
++
++    // Touched only on the thread that drives the core (load, run, unload, deinit).
++    bool SessionActive = false;
++
++    void Report(int code) noexcept {
++        LastReported.store(code, std::memory_order_release);
++        if (Listener listener = CurrentListener.load(std::memory_order_acquire)) {
++            listener(code);
++        }
++    }
++
++    int ReadCode(const melonDS::NDS* nds) noexcept {
++        if (!nds) {
++            return 0;
++        }
++
++        int code = nds->Wifi.GetAPClientStatus();
++        if (code < 0 || code > 2) {
++            // The access point only knows these three states; anything else counts as offline.
++            return 0;
++        }
++
++        return code;
++    }
++}
++
++void MelonDsDs::gamuroid::NetStateSessionBegin() noexcept {
++    LastReported.store(0, std::memory_order_release);
++    SessionActive = true;
++}
++
++void MelonDsDs::gamuroid::NetStateTick(const melonDS::NDS* nds) noexcept {
++    if (!SessionActive) {
++        return;
++    }
++
++    int code = ReadCode(nds);
++    if (code != LastReported.load(std::memory_order_acquire)) {
++        retro::info("Online state changed to {}", code);
++        Report(code);
++    }
++}
++
++void MelonDsDs::gamuroid::NetStateSessionEnd() noexcept {
++    if (SessionActive && LastReported.load(std::memory_order_acquire) != 0) {
++        retro::info("Session ended while online; reporting offline");
++        Report(0);
++    }
++
++    SessionActive = false;
++    LastReported.store(0, std::memory_order_release);
++}
++
++void MelonDsDs::gamuroid::NetStateForget() noexcept {
++    CurrentListener.store(nullptr, std::memory_order_release);
++    SessionActive = false;
++    LastReported.store(0, std::memory_order_release);
++}
++
++extern "C" int gamuroid_net_state_get(void) {
++    return LastReported.load(std::memory_order_acquire);
++}
++
++extern "C" void gamuroid_net_state_listen(void (*listener)(int code)) {
++    CurrentListener.store(listener, std::memory_order_release);
++}
+diff --git a/src/libretro/gamuroid/net_state.hpp b/src/libretro/gamuroid/net_state.hpp
+new file mode 100644
+index 00000000..ebe16b54
+--- /dev/null
++++ b/src/libretro/gamuroid/net_state.hpp
+@@ -0,0 +1,58 @@
++/*
++    Copyright 2026 Gamuroid contributors
++
++    This file is part of a modified version of melonDS DS.
++
++    melonDS DS is free software: you can redistribute it and/or modify it under
++    the terms of the GNU General Public License as published by the Free
++    Software Foundation, either version 3 of the License, or (at your option)
++    any later version.
++
++    melonDS DS is distributed in the hope that it will be useful, but WITHOUT ANY
++    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License along
++    with melonDS DS. If not, see http://www.gnu.org/licenses/.
++*/
++
++#ifndef MELONDSDS_GAMUROID_NET_STATE_HPP
++#define MELONDSDS_GAMUROID_NET_STATE_HPP
++
++// Online state of the emulated console for the frontend (Gamuroid protocol P2).
++//
++// Codes: 0 = not associated with the emulated access point,
++//        1 = authenticated, not yet associated,
++//        2 = associated (online).
++//
++// The frontend resolves two C functions from the loaded core:
++//   int  gamuroid_net_state_get(void);
++//   void gamuroid_net_state_listen(void (*listener)(int code));   // NULL stops
++// The listener runs on the thread that runs retro_run (or retro_unload_game),
++// only when the code changes, and must not call back into the core.
++
++namespace melonDS {
++    class NDS;
++}
++
++namespace MelonDsDs::gamuroid {
++    /// Called at retro_load_game: the new session starts offline, silently.
++    void NetStateSessionBegin() noexcept;
++
++    /// Called once per retro_run, after the frame: reports a changed code.
++    void NetStateTick(const melonDS::NDS* nds) noexcept;
++
++    /// Called at retro_unload_game: reports 0 if the session ended online,
++    /// then stays quiet until the next session begins.
++    void NetStateSessionEnd() noexcept;
++
++    /// Called at retro_deinit: forgets the listener.
++    void NetStateForget() noexcept;
++}
++
++extern "C" {
++    __attribute__((visibility("default"))) int gamuroid_net_state_get(void);
++    __attribute__((visibility("default"))) void gamuroid_net_state_listen(void (*listener)(int code));
++}
++
++#endif // MELONDSDS_GAMUROID_NET_STATE_HPP
+diff --git a/src/libretro/libretro.cpp b/src/libretro/libretro.cpp
+index b56f23aa..7cb75d4b 100644
+--- a/src/libretro/libretro.cpp
++++ b/src/libretro/libretro.cpp
+@@ -40,6 +40,7 @@
+ #include "core/core.hpp"
+ #include "environment.hpp"
+ #include "exceptions.hpp"
++#include "gamuroid/net_state.hpp"
+ #include "info.hpp"
+ #include "retro/task_queue.hpp"
+ #include "sram.hpp"
+@@ -93,6 +94,7 @@ PUBLIC_SYMBOL bool retro_load_game(const struct retro_game_info *info) {
+ 
+     std::span<const retro_game_info> content = info ? std::span(info, 1) : std::span<const retro_game_info>();
+ 
++    MelonDsDs::gamuroid::NetStateSessionBegin();
+     return MelonDsDs::Core.LoadGame(MelonDsDs::MELONDSDS_GAME_TYPE_NDS, content);
+ }
+ 
+@@ -115,6 +117,7 @@ PUBLIC_SYMBOL [[gnu::hot]] void retro_run(void) {
+     {
+         ZoneScopedN(TracyFunction);
+         MelonDsDs::Core.Run();
++        MelonDsDs::gamuroid::NetStateTick(MelonDsDs::Core.GetConsole());
+     }
+     FrameMark;
+ }
+@@ -131,6 +134,7 @@ PUBLIC_SYMBOL void retro_unload_game(void) {
+     retro::task::wait();
+     retro::task::deinit();
+ 
++    MelonDsDs::gamuroid::NetStateSessionEnd();
+     Core.UnloadGame();
+ }
+ 
+@@ -142,6 +146,7 @@ PUBLIC_SYMBOL bool retro_load_game_special(unsigned type, const struct retro_gam
+     ZoneScopedN(TracyFunction);
+     retro::debug("retro_load_game_special({}, {}, {})", MelonDsDs::get_game_type_name(type), fmt::ptr(info), num);
+ 
++    MelonDsDs::gamuroid::NetStateSessionBegin();
+     return MelonDsDs::Core.LoadGame(type, std::span(info, num));
+ }
+ 
+@@ -153,6 +158,7 @@ PUBLIC_SYMBOL void retro_deinit(void) {
+         ZoneScopedN(TracyFunction);
+         retro::debug("retro_deinit()");
+         retro::task::deinit();
++        MelonDsDs::gamuroid::NetStateForget();
+         MelonDsDs::Core.~CoreState(); // placement delete
+         memset(MelonDsDs::CoreStateBuffer.data(), 0, MelonDsDs::CoreStateBuffer.size());
+         retro_assert(!MelonDsDs::Core.IsInitialized());

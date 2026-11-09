@@ -1,0 +1,90 @@
+From 5de6fb9b10d11ceb2b7230eab6abdd560a9b0f85 Mon Sep 17 00:00:00 2001
+From: thang <thang@local>
+Date: Sat, 7 Nov 2026 05:10:43 +0700
+Subject: [PATCH 2/5] Gamuroid C3: resync the RTC to the host clock after a
+ state load
+
+After a successful DS-mode state load in the Real or Relative start-time
+mode, set the emulated date and time from the host clock with the same
+rules as at boot, and keep every other RTC register (alarms, interrupt
+flags, status, 12/24-hour mode) from the state. Absolute mode keeps the
+state's clock; Sync mode is unchanged (it already follows the host every
+frame).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/libretro/core/core.cpp | 39 ++++++++++++++++++++++++++++++++++++++
+ src/libretro/core/core.hpp |  3 +++
+ 2 files changed, 42 insertions(+)
+
+diff --git a/src/libretro/core/core.cpp b/src/libretro/core/core.cpp
+index df32f077..dfd6c931 100644
+--- a/src/libretro/core/core.cpp
++++ b/src/libretro/core/core.cpp
+@@ -542,6 +542,41 @@ void MelonDsDs::CoreState::SetConsoleTime(melonDS::NDS& nds, local_seconds time)
+     );
+ }
+ 
++void MelonDsDs::CoreState::ResyncClockAfterStateLoad(melonDS::NDS& nds) noexcept {
++    ZoneScopedN(TracyFunction);
++
++    switch (Config.StartTimeMode()) {
++        case StartTimeMode::Real:
++        case StartTimeMode::Relative:
++            break;
++        case StartTimeMode::Absolute:
++            // A fixed start time is the player's choice; keep the clock the state was saved with.
++            return;
++        case StartTimeMode::Sync:
++            // Run() already sets the clock from the host every frame.
++            return;
++    }
++
++    if (static_cast<ConsoleType>(nds.ConsoleType) != ConsoleType::DS) {
++        // Only DS-mode states can be loaded (see Unserialize).
++        return;
++    }
++
++    // SetDateTime also touches a status bit, so keep everything but the date and time
++    // exactly as the state left it (alarms, interrupt flags, status, 12/24-hour mode).
++    melonDS::RTC::StateData loaded {};
++    nds.RTC.GetState(loaded);
++
++    SetConsoleTime(nds);
++
++    melonDS::RTC::StateData resynced {};
++    nds.RTC.GetState(resynced);
++    memcpy(loaded.DateTime, resynced.DateTime, sizeof(loaded.DateTime));
++    nds.RTC.SetState(loaded);
++
++    retro::info("Resynced the RTC to the host clock after loading a state");
++}
++
+ // When requesting an OpenGL context, we may not get it immediately.
+ // So we need to wait until we do.
+ void MelonDsDs::CoreState::StartConsole() {
+@@ -1103,6 +1138,10 @@ bool MelonDsDs::CoreState::Unserialize(std::span<const std::byte> data) noexcept
+     if (!(Console->DoSavestate(&savestate) && !savestate.Error))
+         return false;
+ 
++    // The state carries the clock of the moment it was saved;
++    // bring it forward to now, as a cold boot would (Gamuroid C3).
++    ResyncClockAfterStateLoad(*Console);
++
+     // The loaded state's Rumble Pak register may differ from the one we just left,
+     // but melonDS won't report that as a flip;
+     // drop the buffered activity so the new timeline starts quiet.
+diff --git a/src/libretro/core/core.hpp b/src/libretro/core/core.hpp
+index bb52319e..4b44c81a 100644
+--- a/src/libretro/core/core.hpp
++++ b/src/libretro/core/core.hpp
+@@ -133,6 +133,9 @@ namespace MelonDsDs {
+         [[gnu::cold]] void StartConsole();
+         [[gnu::cold]] void SetConsoleTime(melonDS::NDS& nds) noexcept;
+         [[gnu::cold]] void SetConsoleTime(melonDS::NDS& nds, local_seconds time) noexcept;
++        /// Gamuroid C3: after a state load, moves the emulated clock to the host time
++        /// (with the start-time mode's offset), keeping every other RTC register from the state.
++        [[gnu::cold]] void ResyncClockAfterStateLoad(melonDS::NDS& nds) noexcept;
+         /// \return The header of the loaded NDS ROM,
+         /// or \c nullptr if there isn't one (or if it's too short to be trusted).
+         [[nodiscard]] const melonDS::NDSHeader* LoadedHeader() const noexcept;

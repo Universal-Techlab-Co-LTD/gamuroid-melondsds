@@ -1,0 +1,948 @@
+From 180a136c53c183f8d6ad455d317e6f07d747435e Mon Sep 17 00:00:00 2001
+From: thang <thang@local>
+Date: Sat, 7 Nov 2026 05:17:50 +0700
+Subject: [PATCH 5/5] Gamuroid C1: skin-defined screen boxes through
+ gamuroid_screen_layout
+
+New core option gamuroid_screen_layout (declared value 'auto'). The
+frontend answers it with
+  L1;canvas=WxH;upper=x,y,w,h|none;lower=x,y,w,h|none[;rev=n]
+While the value is valid it overrides the screen layout options:
+- the output frame is the canvas; uncovered area is black; each visible
+  screen is scaled (nearest neighbour) to fill its box, clipped to the
+  canvas, the touch screen drawn last;
+- the pointer, normalized over the canvas, maps into the lower box; a
+  press must start on that box, then clamps to the screen's edge until
+  release; no touch while the lower box is hidden; the cursor is drawn
+  in the lower box;
+- the reported maximum size grows to max(W,H) squared so a rotation is
+  only a geometry change; a larger canvas later updates the AV info;
+- an invalid value keeps the last valid layout of the session (or the
+  configured layouts) and is logged once; 'auto' or empty returns to
+  the configured layouts;
+- all of this is per session (reset at load and unload) and never
+  touches save states.
+Parser in gamuroid/screen_layout_value.cpp (no emulator dependency,
+unit-tested on the host).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/libretro/CMakeLists.txt                   |   2 +
+ src/libretro/config/config.cpp                |   3 +
+ src/libretro/config/config.hpp                |   8 +
+ src/libretro/config/constants.hpp             |   2 +
+ src/libretro/config/definitions.hpp           |   1 +
+ src/libretro/config/definitions/screen.hpp    |  19 ++
+ src/libretro/core/core.cpp                    |   7 +
+ src/libretro/gamuroid/screen_layout_value.cpp | 205 ++++++++++++++++++
+ src/libretro/gamuroid/screen_layout_value.hpp |  89 ++++++++
+ src/libretro/input/cursor.cpp                 |  33 ++-
+ src/libretro/input/cursor.hpp                 |   6 +
+ src/libretro/render/software.cpp              |  66 +++++-
+ src/libretro/render/software.hpp              |   7 +
+ src/libretro/screenlayout.cpp                 | 115 ++++++++++
+ src/libretro/screenlayout.hpp                 |  42 +++-
+ 15 files changed, 600 insertions(+), 5 deletions(-)
+ create mode 100644 src/libretro/gamuroid/screen_layout_value.cpp
+ create mode 100644 src/libretro/gamuroid/screen_layout_value.hpp
+
+diff --git a/src/libretro/CMakeLists.txt b/src/libretro/CMakeLists.txt
+index 6756af33..13200922 100644
+--- a/src/libretro/CMakeLists.txt
++++ b/src/libretro/CMakeLists.txt
+@@ -58,6 +58,8 @@ add_library(melondsds_libretro ${LIBRARY_TYPE}
+     format.hpp
+     gamuroid/net_state.cpp
+     gamuroid/net_state.hpp
++    gamuroid/screen_layout_value.cpp
++    gamuroid/screen_layout_value.hpp
+     glsym_private.cpp
+     glsym_private.h
+     info.cpp
+diff --git a/src/libretro/config/config.cpp b/src/libretro/config/config.cpp
+index 641ce918..338f9075 100644
+--- a/src/libretro/config/config.cpp
++++ b/src/libretro/config/config.cpp
+@@ -862,6 +862,9 @@ static void MelonDsDs::config::ParseScreenOptions(CoreConfig& config) noexcept {
+     }
+ 
+     config.SetScreenLayouts(layouts);
++
++    // Copied right away: the frontend's string is only valid until its next call
++    config.SetGamuroidScreenLayout(get_variable(GAMUROID_SCREEN_LAYOUT));
+ }
+ 
+ static void MelonDsDs::config::ParseVideoOptions(CoreConfig& config) noexcept {
+diff --git a/src/libretro/config/config.hpp b/src/libretro/config/config.hpp
+index 20c526d8..e8d9f6c3 100644
+--- a/src/libretro/config/config.hpp
++++ b/src/libretro/config/config.hpp
+@@ -274,6 +274,13 @@ namespace MelonDsDs {
+         [[nodiscard]] unsigned HybridRatio() const noexcept { return _hybridRatio; }
+         void SetHybridRatio(unsigned hybridRatio) noexcept { _hybridRatio = hybridRatio; }
+ 
++        /// Raw value of gamuroid_screen_layout ("auto", empty, or a layout from the frontend)
++        [[nodiscard]] std::string_view GamuroidScreenLayout() const noexcept { return _gamuroidScreenLayout; }
++        void SetGamuroidScreenLayout(std::string_view value) {
++            if (value.empty()) _gamuroidScreenLayout.clear();
++            else _gamuroidScreenLayout.assign(value.data(), value.size());
++        }
++
+         [[nodiscard]] HybridSideScreenDisplay SmallScreenLayout() const noexcept { return _smallScreenLayout; }
+         void SetSmallScreenLayout(HybridSideScreenDisplay smallScreenLayout) noexcept { _smallScreenLayout = smallScreenLayout; }
+ 
+@@ -514,6 +521,7 @@ namespace MelonDsDs {
+         MelonDsDs::ScreenFilter _secondaryScreenFilter = MelonDsDs::ScreenFilter::Nearest;
+         unsigned _hybridRatio = 2;
+         HybridSideScreenDisplay _smallScreenLayout;
++        string _gamuroidScreenLayout;
+         unsigned _cursorSize = 2.0f;
+         MelonDsDs::CursorMode _cursorMode = CursorMode::Always;
+         unsigned _cursorTimeout = 3;
+diff --git a/src/libretro/config/constants.hpp b/src/libretro/config/constants.hpp
+index e51359f3..91e58296 100644
+--- a/src/libretro/config/constants.hpp
++++ b/src/libretro/config/constants.hpp
+@@ -118,6 +118,8 @@ namespace MelonDsDs::config {
+         static constexpr const char *const JOYSTICK_CURSOR_MAXSPEED = "melonds_joystick_cursor_maxspeed";
+         static constexpr const char *const JOYSTICK_CURSOR_RESPONSE = "melonds_joystick_cursor_response";
+         static constexpr const char *const JOYSTICK_CURSOR_SPEEDUP = "melonds_joystick_cursor_speedup";
++        /// Screen boxes from the frontend's skin (Gamuroid protocol P1); see gamuroid/screen_layout_value.hpp
++        static constexpr const char *const GAMUROID_SCREEN_LAYOUT = "gamuroid_screen_layout";
+         static constexpr std::array SCREEN_LAYOUTS = {
+                 SCREEN_LAYOUT1,
+                 SCREEN_LAYOUT2,
+diff --git a/src/libretro/config/definitions.hpp b/src/libretro/config/definitions.hpp
+index 8f0f52d7..0deb6d25 100644
+--- a/src/libretro/config/definitions.hpp
++++ b/src/libretro/config/definitions.hpp
+@@ -80,6 +80,7 @@ namespace MelonDsDs::config::definitions {
+         ScreenGap,
+         SecondaryScreenScale,
+         SecondaryScreenFiltering,
++        GamuroidScreenLayout,
+ 
+         DnsOverride,
+         Language,
+diff --git a/src/libretro/config/definitions/screen.hpp b/src/libretro/config/definitions/screen.hpp
+index 5a233470..eb6f4892 100644
+--- a/src/libretro/config/definitions/screen.hpp
++++ b/src/libretro/config/definitions/screen.hpp
+@@ -407,6 +407,24 @@ namespace MelonDsDs::config::definitions {
+         MelonDsDs::config::values::NEAREST
+     };
+ 
++    /// Set by the Gamuroid frontend to place each screen in its skin's screen box.
++    /// Only "auto" is declared; the frontend answers with a layout value of its own
++    /// (format in gamuroid/screen_layout_value.hpp), which overrides the layouts below while valid.
++    constexpr retro_core_option_v2_definition GamuroidScreenLayout {
++        config::screen::GAMUROID_SCREEN_LAYOUT,
++        "Skin Screen Layout",
++        nullptr,
++        "Set by the frontend to place each screen where its controller skin wants it. "
++        "Automatic uses the screen layouts below.",
++        nullptr,
++        config::screen::CATEGORY,
++        {
++            {MelonDsDs::config::values::AUTO, "Automatic"},
++            {nullptr, nullptr},
++        },
++        MelonDsDs::config::values::AUTO
++    };
++
+     constexpr retro_core_option_v2_definition NumberOfScreenLayouts {
+         config::screen::NUMBER_OF_SCREEN_LAYOUTS,
+         "# of Screen Layouts",
+@@ -691,6 +709,7 @@ namespace MelonDsDs::config::definitions {
+         ScreenGap,
+         SecondaryScreenScale,
+         SecondaryScreenFiltering,
++        GamuroidScreenLayout,
+     };
+ }
+ 
+diff --git a/src/libretro/core/core.cpp b/src/libretro/core/core.cpp
+index dfd6c931..df840d87 100644
+--- a/src/libretro/core/core.cpp
++++ b/src/libretro/core/core.cpp
+@@ -130,6 +130,9 @@ void MelonDsDs::CoreState::UnloadGame() noexcept {
+     // Just in case the frontend forgets to stop the rumbling
+     _inputState.StopRumble();
+ 
++    // No skin layout carries over into the next session
++    _screenLayout.ResetCustomLayoutSession();
++
+     if (!Console) {
+         // The console object may be uninitialized
+         // if unloading a game after exiting from the error screen.
+@@ -654,6 +657,10 @@ void MelonDsDs::CoreState::DestroyRenderState() {
+ bool MelonDsDs::CoreState::LoadGame(unsigned type, std::span<const retro_game_info> game) noexcept try {
+     ZoneScopedN(TracyFunction);
+ 
++    // Start this session without any skin layout from a previous one;
++    // ApplyConfig below reads the frontend's current value.
++    _screenLayout.ResetCustomLayoutSession();
++
+     InitContent(type, game);
+ 
+     // ...then load the game.
+diff --git a/src/libretro/gamuroid/screen_layout_value.cpp b/src/libretro/gamuroid/screen_layout_value.cpp
+new file mode 100644
+index 00000000..e37f0dab
+--- /dev/null
++++ b/src/libretro/gamuroid/screen_layout_value.cpp
+@@ -0,0 +1,205 @@
++/*
++    Copyright 2026 Gamuroid contributors
++
++    This file is part of a modified version of melonDS DS.
++
++    melonDS DS is free software: you can redistribute it and/or modify it under
++    the terms of the GNU General Public License as published by the Free
++    Software Foundation, either version 3 of the License, or (at your option)
++    any later version.
++
++    melonDS DS is distributed in the hope that it will be useful, but WITHOUT ANY
++    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License along
++    with melonDS DS. If not, see http://www.gnu.org/licenses/.
++*/
++
++#include "screen_layout_value.hpp"
++
++namespace {
++    using MelonDsDs::gamuroid::ParsedScreenLayoutValue;
++    using MelonDsDs::gamuroid::ScreenBox;
++    using MelonDsDs::gamuroid::ScreenLayoutValueKind;
++    using std::string_view;
++
++    ParsedScreenLayoutValue Invalid(const char* reason) noexcept {
++        ParsedScreenLayoutValue result;
++        result.kind = ScreenLayoutValueKind::Invalid;
++        result.reason = reason;
++        return result;
++    }
++
++    bool IsAllowedCharacter(char c) noexcept {
++        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || c == '=' || c == ',' || c == ';' || c == 'L';
++    }
++
++    /// Unsigned decimal integer, digits only, no sign; false on overflow past max or on any other character.
++    bool ParseDecimal(string_view text, uint64_t max, uint64_t& out) noexcept {
++        if (text.empty()) {
++            return false;
++        }
++
++        uint64_t value = 0;
++        for (char c : text) {
++            if (c < '0' || c > '9') {
++                return false;
++            }
++
++            value = value * 10 + static_cast<uint64_t>(c - '0');
++            if (value > max) {
++                // Also stops any overflow of the accumulator, since max is far below 2^63.
++                return false;
++            }
++        }
++
++        out = value;
++        return true;
++    }
++
++    /// "WxH", each 1..SCREEN_LAYOUT_MAX_CANVAS
++    bool ParseCanvas(string_view text, uint32_t& width, uint32_t& height) noexcept {
++        size_t separator = text.find('x');
++        if (separator == string_view::npos) {
++            return false;
++        }
++
++        uint64_t w = 0;
++        uint64_t h = 0;
++        if (!ParseDecimal(text.substr(0, separator), MelonDsDs::gamuroid::SCREEN_LAYOUT_MAX_CANVAS, w) ||
++            !ParseDecimal(text.substr(separator + 1), MelonDsDs::gamuroid::SCREEN_LAYOUT_MAX_CANVAS, h)) {
++            return false;
++        }
++
++        if (w == 0 || h == 0) {
++            return false;
++        }
++
++        width = static_cast<uint32_t>(w);
++        height = static_cast<uint32_t>(h);
++        return true;
++    }
++
++    /// "none" or "x,y,w,h", each 0..SCREEN_LAYOUT_MAX_BOX
++    bool ParseBox(string_view text, ScreenBox& box) noexcept {
++        if (text == "none") {
++            box = ScreenBox {};
++            return true;
++        }
++
++        uint64_t numbers[4] {};
++        for (int i = 0; i < 4; i++) {
++            size_t comma = text.find(',');
++            string_view part = (i < 3) ? text.substr(0, comma) : text;
++            if (i < 3 && comma == string_view::npos) {
++                return false;
++            }
++
++            if (!ParseDecimal(part, MelonDsDs::gamuroid::SCREEN_LAYOUT_MAX_BOX, numbers[i])) {
++                // (A fifth number leaves a comma in the last part, which fails here too.)
++                return false;
++            }
++
++            if (i < 3) {
++                text.remove_prefix(comma + 1);
++            }
++        }
++
++        box.x = static_cast<int32_t>(numbers[0]);
++        box.y = static_cast<int32_t>(numbers[1]);
++        box.w = static_cast<int32_t>(numbers[2]);
++        box.h = static_cast<int32_t>(numbers[3]);
++
++        if (!box.Visible()) {
++            // Zero width or height means the same as "none"
++            box = ScreenBox {};
++        }
++
++        return true;
++    }
++}
++
++ParsedScreenLayoutValue MelonDsDs::gamuroid::ParseScreenLayoutValue(string_view value) noexcept {
++    if (value.empty() || value == "auto") {
++        return ParsedScreenLayoutValue {};
++    }
++
++    for (char c : value) {
++        if (!IsAllowedCharacter(c)) {
++            return Invalid("unexpected character");
++        }
++    }
++
++    if (value.back() == ';') {
++        // A trailing empty field is ignored
++        value.remove_suffix(1);
++    }
++
++    bool haveCanvas = false;
++    bool haveUpper = false;
++    bool haveLower = false;
++    bool haveRevision = false;
++    ParsedScreenLayoutValue result;
++    result.kind = ScreenLayoutValueKind::Custom;
++
++    bool first = true;
++    while (true) {
++        size_t end = value.find(';');
++        string_view field = value.substr(0, end);
++
++        if (first) {
++            if (field != "L1") {
++                return Invalid("unsupported format version");
++            }
++            first = false;
++        }
++        else {
++            size_t equals = field.find('=');
++            if (field.empty() || equals == string_view::npos || equals == 0) {
++                return Invalid("malformed field");
++            }
++
++            string_view name = field.substr(0, equals);
++            string_view text = field.substr(equals + 1);
++
++            if (name == "canvas") {
++                if (haveCanvas) return Invalid("duplicate canvas");
++                if (!ParseCanvas(text, result.layout.canvasWidth, result.layout.canvasHeight)) return Invalid("malformed canvas");
++                haveCanvas = true;
++            }
++            else if (name == "upper") {
++                if (haveUpper) return Invalid("duplicate upper");
++                if (!ParseBox(text, result.layout.upper)) return Invalid("malformed upper");
++                haveUpper = true;
++            }
++            else if (name == "lower") {
++                if (haveLower) return Invalid("duplicate lower");
++                if (!ParseBox(text, result.layout.lower)) return Invalid("malformed lower");
++                haveLower = true;
++            }
++            else if (name == "rev") {
++                uint64_t revision = 0;
++                if (haveRevision) return Invalid("duplicate rev");
++                if (!ParseDecimal(text, UINT32_MAX, revision)) return Invalid("malformed rev");
++                result.layout.revision = static_cast<uint32_t>(revision);
++                haveRevision = true;
++            }
++            else {
++                // Unknown field: ignored, for forward compatibility
++            }
++        }
++
++        if (end == string_view::npos) {
++            break;
++        }
++
++        value.remove_prefix(end + 1);
++    }
++
++    if (!haveCanvas) return Invalid("missing canvas");
++    if (!haveUpper) return Invalid("missing upper");
++    if (!haveLower) return Invalid("missing lower");
++
++    return result;
++}
+diff --git a/src/libretro/gamuroid/screen_layout_value.hpp b/src/libretro/gamuroid/screen_layout_value.hpp
+new file mode 100644
+index 00000000..9186c63b
+--- /dev/null
++++ b/src/libretro/gamuroid/screen_layout_value.hpp
+@@ -0,0 +1,89 @@
++/*
++    Copyright 2026 Gamuroid contributors
++
++    This file is part of a modified version of melonDS DS.
++
++    melonDS DS is free software: you can redistribute it and/or modify it under
++    the terms of the GNU General Public License as published by the Free
++    Software Foundation, either version 3 of the License, or (at your option)
++    any later version.
++
++    melonDS DS is distributed in the hope that it will be useful, but WITHOUT ANY
++    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License along
++    with melonDS DS. If not, see http://www.gnu.org/licenses/.
++*/
++
++#ifndef MELONDSDS_GAMUROID_SCREEN_LAYOUT_VALUE_HPP
++#define MELONDSDS_GAMUROID_SCREEN_LAYOUT_VALUE_HPP
++
++// Value of the core option "gamuroid_screen_layout" (Gamuroid protocol P1, format version 1).
++//
++//   auto | <empty>                       -> the core's own layout options apply
++//   L1;canvas=WxH;upper=x,y,w,h|none;lower=x,y,w,h|none[;rev=n]
++//
++// Fields after "L1" may come in any order; unknown fields are ignored;
++// a missing, duplicated or malformed required field makes the whole value invalid.
++// A box with zero width or height is the same as "none".
++// This header has no dependencies on the rest of the core, so it can be unit-tested on the host.
++
++#include <cstdint>
++#include <string_view>
++
++namespace MelonDsDs::gamuroid {
++    constexpr unsigned SCREEN_LAYOUT_MAX_CANVAS = 8192;
++    constexpr unsigned SCREEN_LAYOUT_MAX_BOX = 16384;
++
++    /// A screen box in canvas pixels, origin top-left.
++    /// Not visible when its width or height is 0.
++    struct ScreenBox {
++        int32_t x = 0;
++        int32_t y = 0;
++        int32_t w = 0;
++        int32_t h = 0;
++
++        [[nodiscard]] bool Visible() const noexcept { return w > 0 && h > 0; }
++        bool operator==(const ScreenBox& other) const noexcept {
++            return x == other.x && y == other.y && w == other.w && h == other.h;
++        }
++        bool operator!=(const ScreenBox& other) const noexcept { return !(*this == other); }
++    };
++
++    struct CustomScreenLayout {
++        uint32_t canvasWidth = 0;
++        uint32_t canvasHeight = 0;
++        /// The console's primary display (DS top screen).
++        ScreenBox upper {};
++        /// The console's touch display (DS bottom screen).
++        ScreenBox lower {};
++        uint32_t revision = 0;
++
++        bool operator==(const CustomScreenLayout& other) const noexcept {
++            return canvasWidth == other.canvasWidth && canvasHeight == other.canvasHeight &&
++                upper == other.upper && lower == other.lower && revision == other.revision;
++        }
++        bool operator!=(const CustomScreenLayout& other) const noexcept { return !(*this == other); }
++    };
++
++    enum class ScreenLayoutValueKind {
++        /// "auto" or empty: use the core's own layout.
++        Automatic,
++        /// A valid custom layout.
++        Custom,
++        /// Malformed; see the reason.
++        Invalid,
++    };
++
++    struct ParsedScreenLayoutValue {
++        ScreenLayoutValueKind kind = ScreenLayoutValueKind::Automatic;
++        CustomScreenLayout layout {};
++        /// Static string; set when kind is Invalid.
++        const char* reason = nullptr;
++    };
++
++    [[nodiscard]] ParsedScreenLayoutValue ParseScreenLayoutValue(std::string_view value) noexcept;
++}
++
++#endif // MELONDSDS_GAMUROID_SCREEN_LAYOUT_VALUE_HPP
+diff --git a/src/libretro/input/cursor.cpp b/src/libretro/input/cursor.cpp
+index 98b87665..30994c64 100644
+--- a/src/libretro/input/cursor.cpp
++++ b/src/libretro/input/cursor.cpp
+@@ -66,12 +66,33 @@ void CursorState::Update(const CoreConfig& config, const ScreenLayoutData& layou
+     _pointerCursorLastUpdate = pointer.LastPointerUpdate();
+     _isTouchReleased = pointer.CursorReleased() || joypad.TouchReleased();
+ 
++    _touchScreenHidden = !layout.TouchScreenVisible();
++
+     if (_touchMode == TouchMode::Pointer || _touchMode == TouchMode::Auto) {
+         _pointerRawPosition = pointer.RawPosition();
+-        _pointerCursorTouching = pointer.IsTouching();
++        bool pressed = pointer.IsTouching();
+         _pointerCursorPosition = layout.TransformPointerInput(_pointerRawPosition);
+         _hybridTouchPosition = layout.TransformPointerInputToHybridScreen(_pointerRawPosition);
+ 
++        if (layout.CustomLayoutActive()) {
++            // A press that starts off the touch screen's box isn't a touch;
++            // one that starts on it follows the finger (clamped to the screen's edge) until release.
++            if (!pressed || _touchScreenHidden) {
++                _customPressOnTouchScreen = false;
++            }
++            else if (!_pointerWasPressed) {
++                _customPressOnTouchScreen = layout.PointerOnCustomTouchScreen(_pointerRawPosition);
++            }
++
++            _pointerCursorTouching = pressed && _customPressOnTouchScreen;
++        }
++        else {
++            _customPressOnTouchScreen = false;
++            _pointerCursorTouching = pressed;
++        }
++
++        _pointerWasPressed = pressed;
++
+         if (pointer.CursorActive()) {
+             // If the player moved, pressed, or released the pointer within the past frame...
+             ResetCursorTimeout();
+@@ -185,6 +206,11 @@ void CursorState::ResetCursorTimeout() noexcept {
+ uvec2 CursorState::ConsoleTouchPosition(const ScreenLayoutData& layout) const noexcept {
+     uvec2 clampedTouch;
+ 
++    if (layout.CustomLayoutActive()) {
++        // One touch screen box, no hybrid copy
++        return uvec2(clamp(TouchPosition(), ivec2(0), NDS_SCREEN_SIZE<int> - 1));
++    }
++
+     switch (layout.Layout()) {
+         case ScreenLayout::HybridBottom:
+         case ScreenLayout::FlippedHybridBottom:
+@@ -239,6 +265,11 @@ ivec2 CursorState::TouchPosition() const noexcept {
+ }
+ 
+ bool CursorState::IsTouching() const noexcept {
++    if (_touchScreenHidden) {
++        // The skin hides the touch screen, so nothing can touch it
++        return false;
++    }
++
+     switch (_touchMode) {
+         case TouchMode::Joystick:
+             return _joypadCursorTouching;
+diff --git a/src/libretro/input/cursor.hpp b/src/libretro/input/cursor.hpp
+index 774b10ba..fa711669 100644
+--- a/src/libretro/input/cursor.hpp
++++ b/src/libretro/input/cursor.hpp
+@@ -73,5 +73,11 @@ namespace MelonDsDs {
+         /// in NDS pixel coordinates.
+         /// Only relevant if a hybrid layout is active
+         glm::ivec2 _hybridTouchPosition;
++
++        // Custom (skin-defined) layout: a press counts only if it starts on the touch screen's box,
++        // and no touch at all reaches the console while that box is hidden.
++        bool _pointerWasPressed = false;
++        bool _customPressOnTouchScreen = false;
++        bool _touchScreenHidden = false;
+     };
+ }
+\ No newline at end of file
+diff --git a/src/libretro/render/software.cpp b/src/libretro/render/software.cpp
+index 0884b702..746b9c62 100644
+--- a/src/libretro/render/software.cpp
++++ b/src/libretro/render/software.cpp
+@@ -17,6 +17,8 @@
+ #include "software.hpp"
+ 
+ #include <cmath>
++#include <cstring>
++#include <algorithm>
+ 
+ #include <retro_assert.h>
+ 
+@@ -132,6 +134,11 @@ void MelonDsDs::SoftwareRenderState::PrepareBuffers(const CoreConfig& config, co
+ 
+     buffer.SetSize(screenLayout.BufferSize());
+ 
++    if (screenLayout.CustomLayoutActive()) {
++        // The skin's boxes are drawn straight into the output; no staging buffers needed
++        return;
++    }
++
+     if (IsHybridLayout(screenLayout.Layout()) || IsLargeScreenLayout(screenLayout.Layout())) {
+         uvec2 requiredHybridBufferSize = NDS_SCREEN_SIZE<unsigned> * screenLayout.HybridRatio();
+         hybridBuffer.SetSize(requiredHybridBufferSize);
+@@ -179,11 +186,11 @@ void MelonDsDs::SoftwareRenderState::DrawCursor(const InputState& input, const C
+     ZoneScopedN(TracyFunction);
+     // Only used for software rendering
+ 
+-    if (screenLayout.Layout() == ScreenLayout::TopOnly)
++    if (screenLayout.CustomLayoutActive() ? !screenLayout.TouchScreenVisible() : screenLayout.Layout() == ScreenLayout::TopOnly)
+         return;
+ 
+     float cursorRadius = config.CursorSize();
+-    if (screenLayout.Layout() == ScreenLayout::LargescreenBottom || screenLayout.Layout() == ScreenLayout::FlippedLargescreenBottom) {
++    if (!screenLayout.CustomLayoutActive() && (screenLayout.Layout() == ScreenLayout::LargescreenBottom || screenLayout.Layout() == ScreenLayout::FlippedLargescreenBottom)) {
+         cursorRadius *= static_cast<float>(screenLayout.HybridRatio());
+     }
+ 
+@@ -193,7 +200,7 @@ void MelonDsDs::SoftwareRenderState::DrawCursor(const InputState& input, const C
+     bool secondaryTouchInBounds =
+         (input.TouchPosition().x >= 0 && input.TouchPosition().x < NDS_SCREEN_WIDTH) &&
+         (input.TouchPosition().y >= 0 && input.TouchPosition().y < NDS_SCREEN_HEIGHT);
+-    bool touchUsesHybrid =
++    bool touchUsesHybrid = !screenLayout.CustomLayoutActive() &&
+         (layout == ScreenLayout::HybridBottom || layout == ScreenLayout::FlippedHybridBottom) &&
+         (screenLayout.HybridSmallScreenLayout() == HybridSideScreenDisplay::One || !secondaryTouchInBounds);
+ 
+@@ -227,6 +234,13 @@ void MelonDsDs::SoftwareRenderState::CombineScreens(
+     buffer.Clear();
+     ScreenLayout layout = screenLayout.Layout();
+ 
++    if (const auto& custom = screenLayout.CustomLayout()) {
++        // Skin-defined boxes; the touch screen goes on top if they overlap
++        DrawScreenInBox(topBuffer.data(), custom->upper);
++        DrawScreenInBox(bottomBuffer.data(), custom->lower);
++        return;
++    }
++
+     if (IsHybridLayout(layout)) {
+         auto primaryBuffer = layout == ScreenLayout::HybridTop || layout == ScreenLayout::FlippedHybridTop ? topBuffer : bottomBuffer;
+ 
+@@ -294,3 +308,49 @@ void MelonDsDs::SoftwareRenderState::CombineScreens(
+     }
+ }
+ 
++
++void MelonDsDs::SoftwareRenderState::DrawScreenInBox(const uint32_t* screen, const gamuroid::ScreenBox& box) noexcept {
++    ZoneScopedN(TracyFunction);
++
++    if (!box.Visible()) {
++        return;
++    }
++
++    // Clip the box to the output; the boxes come from the frontend and may lie partly (or entirely) outside it.
++    const int64_t outWidth = buffer.Width();
++    const int64_t outHeight = buffer.Height();
++    const int64_t x0 = std::max<int64_t>(box.x, 0);
++    const int64_t y0 = std::max<int64_t>(box.y, 0);
++    const int64_t x1 = std::min<int64_t>(int64_t(box.x) + box.w, outWidth);
++    const int64_t y1 = std::min<int64_t>(int64_t(box.y) + box.h, outHeight);
++    if (x0 >= x1 || y0 >= y1) {
++        return;
++    }
++
++    // Nearest neighbour: output pixel i of the box samples source pixel floor(i * native / box size)
++    const size_t visibleWidth = static_cast<size_t>(x1 - x0);
++    boxColumnMap.resize(visibleWidth);
++    for (size_t i = 0; i < visibleWidth; i++) {
++        int64_t boxColumn = x0 + int64_t(i) - box.x;
++        int64_t source = (boxColumn * NDS_SCREEN_WIDTH) / box.w;
++        boxColumnMap[i] = static_cast<uint16_t>(std::min<int64_t>(source, NDS_SCREEN_WIDTH - 1));
++    }
++
++    int64_t previousSourceRow = -1;
++    for (int64_t y = y0; y < y1; y++) {
++        int64_t sourceRow = std::min<int64_t>(((y - box.y) * NDS_SCREEN_HEIGHT) / box.h, NDS_SCREEN_HEIGHT - 1);
++        uint32_t* out = buffer[static_cast<unsigned>(y)] + x0;
++
++        if (sourceRow == previousSourceRow) {
++            // Upscaling repeats rows; copy the one we just made
++            memcpy(out, buffer[static_cast<unsigned>(y - 1)] + x0, visibleWidth * sizeof(uint32_t));
++            continue;
++        }
++
++        const uint32_t* in = screen + sourceRow * NDS_SCREEN_WIDTH;
++        for (size_t i = 0; i < visibleWidth; i++) {
++            out[i] = in[boxColumnMap[i]];
++        }
++        previousSourceRow = sourceRow;
++    }
++}
+diff --git a/src/libretro/render/software.hpp b/src/libretro/render/software.hpp
+index c08c753e..5e3a79d0 100644
+--- a/src/libretro/render/software.hpp
++++ b/src/libretro/render/software.hpp
+@@ -19,6 +19,7 @@
+ 
+ #include <optional>
+ #include <span>
++#include <vector>
+ 
+ #include <glm/mat3x3.hpp>
+ #include <glm/vec2.hpp>
+@@ -68,12 +69,18 @@ namespace MelonDsDs {
+             const ScreenLayoutData& screenLayout
+         ) noexcept;
+ 
++        /// Scales one native screen into a box of the output (nearest neighbour),
++        /// clipped to the output; used by the skin-defined (gamuroid_screen_layout) layout.
++        void DrawScreenInBox(const uint32_t* screen, const gamuroid::ScreenBox& box) noexcept;
++
+         PixelBuffer buffer;
+         // Used as a staging area for the hybrid screen to be scaled
+         PixelBuffer hybridBuffer;
+         retro::Scaler hybridScaler;
+         PixelBuffer secondaryScaleBuffer;
+         retro::Scaler secondaryScaleScaler;
++        /// Source column for each output column of the box being drawn (reused between frames)
++        std::vector<uint16_t> boxColumnMap;
+     };
+ }
+ 
+diff --git a/src/libretro/screenlayout.cpp b/src/libretro/screenlayout.cpp
+index fb727c90..1084b376 100644
+--- a/src/libretro/screenlayout.cpp
++++ b/src/libretro/screenlayout.cpp
+@@ -261,12 +261,127 @@ void MelonDsDs::ScreenLayoutData::Apply(const CoreConfig& config, const RenderSt
+     secondaryScreenScale = config.SecondaryScreenScale();
+     secondaryScreenScaleFactor = static_cast<float>(secondaryScreenScale) / 100.0f;
+     HybridRatio(config.HybridRatio());
++    ApplyCustomLayoutValue(config.GamuroidScreenLayout());
+     Update();
+ }
+ 
++void MelonDsDs::ScreenLayoutData::ResetCustomLayoutSession() noexcept {
++    if (_customLayout) {
++        _dirty = true;
++    }
++
++    _customLayout = std::nullopt;
++    _customMaxSize = uvec2(0);
++    _lastInvalidLayoutValue.clear();
++}
++
++void MelonDsDs::ScreenLayoutData::ApplyCustomLayoutValue(std::string_view value) noexcept {
++    ZoneScopedN(TracyFunction);
++    using namespace MelonDsDs::gamuroid;
++
++    ParsedScreenLayoutValue parsed = ParseScreenLayoutValue(value);
++    switch (parsed.kind) {
++        case ScreenLayoutValueKind::Automatic:
++            if (_customLayout) {
++                retro::info("gamuroid_screen_layout is automatic; returning to the configured screen layouts");
++                _customLayout = std::nullopt;
++                _dirty = true;
++            }
++            return;
++        case ScreenLayoutValueKind::Invalid:
++            // Keep whatever layout is active (the last valid custom one, or the configured ones)
++            if (value != _lastInvalidLayoutValue) {
++                retro::warn("Ignoring invalid gamuroid_screen_layout value ({}): \"{}\"", parsed.reason, value);
++                _lastInvalidLayoutValue = std::string(value);
++            }
++            return;
++        case ScreenLayoutValueKind::Custom:
++            break;
++    }
++
++    const CustomScreenLayout& layout = parsed.layout;
++    if (_customLayout && *_customLayout == layout) {
++        // Same geometry and revision: nothing to do
++        return;
++    }
++
++    // Report a maximum that also holds the canvas turned sideways,
++    // so a rotation only needs a geometry change.
++    unsigned side = max(layout.canvasWidth, layout.canvasHeight);
++    _customMaxSize = glm::max(_customMaxSize, uvec2(side));
++
++    retro::info(
++        "Applying gamuroid_screen_layout: canvas {}x{}, upper {},{},{},{}, lower {},{},{},{}, rev {}",
++        layout.canvasWidth, layout.canvasHeight,
++        layout.upper.x, layout.upper.y, layout.upper.w, layout.upper.h,
++        layout.lower.x, layout.lower.y, layout.lower.w, layout.lower.h,
++        layout.revision
++    );
++    _customLayout = layout;
++    _dirty = true;
++}
++
++/// Maps the native screen (256x192) onto a box in canvas pixels.
++/// An invisible box gets the identity, which is never drawn and never touched.
++static mat3 BoxMatrix(const MelonDsDs::gamuroid::ScreenBox& box) noexcept {
++    using namespace MelonDsDs;
++    if (!box.Visible()) {
++        return mat3(1);
++    }
++
++    return math::ts<float>(
++        vec2(box.x, box.y),
++        vec2(float(box.w) / NDS_SCREEN_WIDTH, float(box.h) / NDS_SCREEN_HEIGHT)
++    );
++}
++
++void MelonDsDs::ScreenLayoutData::UpdateCustomLayout() noexcept {
++    ZoneScopedN(TracyFunction);
++    retro_assert(_customLayout.has_value());
++    const gamuroid::CustomScreenLayout& layout = *_customLayout;
++
++    constexpr array<vec2, 4> baseScreenPoints = {
++        vec2(0, 0),
++        vec2(NDS_SCREEN_WIDTH, 0),
++        vec2(NDS_SCREEN_WIDTH, NDS_SCREEN_HEIGHT),
++        vec2(0, NDS_SCREEN_HEIGHT)
++    };
++
++    topScreenMatrix = BoxMatrix(layout.upper);
++    bottomScreenMatrix = BoxMatrix(layout.lower);
++    bottomScreenMatrixInverse = inverse(bottomScreenMatrix);
++    hybridScreenMatrix = mat3(1);
++    hybridScreenMatrixInverse = mat3(1);
++
++    for (size_t i = 0; i < 4; i++) {
++        transformedScreenPoints[i] = topScreenMatrix * vec3(baseScreenPoints[i], 1);
++        transformedScreenPoints[i + 4] = bottomScreenMatrix * vec3(baseScreenPoints[i], 1);
++        transformedScreenPoints[i + 8] = hybridScreenMatrix * vec3(baseScreenPoints[i], 1);
++    }
++
++    // The frame is exactly the canvas; the frontend reports the pointer across all of it
++    bufferSize = uvec2(layout.canvasWidth, layout.canvasHeight);
++    topScreenTranslation = uvec2(max(layout.upper.x, 0), max(layout.upper.y, 0));
++    bottomScreenTranslation = uvec2(max(layout.lower.x, 0), max(layout.lower.y, 0));
++    hybridScreenTranslation = uvec2(0);
++    pointerMatrix = math::ts<float>(vec2(bufferSize) / 2.0f, vec2(bufferSize) / (2.0f * RETRO_MAX_POINTER_COORDINATE<float>));
++
++    // The skin decides where the screens go; never rotate the output
++    // (a rotation to normal may "fail" even though it's the default, as in Update)
++    retro::set_screen_rotation(retro::ScreenOrientation::Normal);
++    orientation = retro::ScreenOrientation::Normal;
++
++    _dirty = false;
++}
++
+ void MelonDsDs::ScreenLayoutData::Update() noexcept {
+     ZoneScopedN(TracyFunction);
+ 
++    if (_customLayout) {
++        UpdateCustomLayout();
++        return;
++    }
++
+     // These points represent the NDS screen coordinates without transformations
+     constexpr array<vec2, 4> baseScreenPoints = {
+         vec2(0, 0), // northwest
+diff --git a/src/libretro/screenlayout.hpp b/src/libretro/screenlayout.hpp
+index 6edc64e4..313af9e2 100644
+--- a/src/libretro/screenlayout.hpp
++++ b/src/libretro/screenlayout.hpp
+@@ -26,6 +26,7 @@
+ #include <libretro.h>
+ #include <gfx/scaler/scaler.h>
+ 
++#include <glm/common.hpp>
+ #include <glm/vec2.hpp>
+ #include <glm/mat3x3.hpp>
+ #include <glm/trigonometric.hpp>
+@@ -34,7 +35,9 @@
+ #include "environment.hpp"
+ #include "input/input.hpp"
+ #include "buffer.hpp"
++#include "gamuroid/screen_layout_value.hpp"
+ #include "retro/scaler.hpp"
++#include <string>
+ 
+ namespace MelonDsDs {
+     class RenderState;
+@@ -147,10 +150,28 @@ namespace MelonDsDs {
+         /// Unlike \c BufferSize, it doesn't depend on the current layout,
+         /// so the frontend can keep the same video output across layout changes.
+         glm::uvec2 MaxBufferSize() const noexcept {
+-            return {MaxBufferWidth(resolutionScale), MaxBufferHeight(resolutionScale)};
++            // A skin-defined layout (gamuroid_screen_layout) may need more;
++            // _customMaxSize only grows within a session, so rotations don't resize the frontend's output.
++            return glm::max(glm::uvec2(MaxBufferWidth(resolutionScale), MaxBufferHeight(resolutionScale)), _customMaxSize);
+         }
+ 
++        /// True while a valid gamuroid_screen_layout value overrides the configured layouts.
++        [[nodiscard]] bool CustomLayoutActive() const noexcept { return _customLayout.has_value(); }
++        [[nodiscard]] const std::optional<gamuroid::CustomScreenLayout>& CustomLayout() const noexcept { return _customLayout; }
++        /// True if the touch screen can be touched: no custom layout, or one with a visible lower box.
++        [[nodiscard]] bool TouchScreenVisible() const noexcept {
++            return !_customLayout || _customLayout->lower.Visible();
++        }
++
++        /// Forgets the custom layout, the grown maximum size and the logged invalid value.
++        /// Called at the start and end of each session.
++        void ResetCustomLayoutSession() noexcept;
++
+         float BufferAspectRatio() const noexcept {
++            if (_customLayout) {
++                return float(BufferWidth()) / float(BufferHeight());
++            }
++
+             switch (Layout()) {
+                 case ScreenLayout::TurnLeft:
+                 case ScreenLayout::TurnRight:
+@@ -201,6 +222,8 @@ namespace MelonDsDs {
+         }
+ 
+         bool IsLayoutRotated() const noexcept {
++            if (_customLayout) return false;
++
+             switch (Layout()) {
+                 case ScreenLayout::TurnLeft:
+                 case ScreenLayout::TurnRight:
+@@ -242,6 +265,16 @@ namespace MelonDsDs {
+             return glm::ivec2(transformed.x, transformed.y);
+         }
+ 
++        /// True if the pointer (in pointer space) is on the visible part of the touch screen's box.
++        /// Only meaningful while a custom layout is active.
++        [[nodiscard]] bool PointerOnCustomTouchScreen(glm::i16vec2 input) const noexcept {
++            if (!_customLayout || !_customLayout->lower.Visible()) return false;
++            glm::vec3 canvas = pointerMatrix * glm::vec3(input, 1.0f);
++            if (canvas.x < 0 || canvas.y < 0 || canvas.x >= float(bufferSize.x) || canvas.y >= float(bufferSize.y)) return false;
++            glm::vec3 console = bottomScreenMatrixInverse * canvas;
++            return console.x >= 0 && console.y >= 0 && console.x < float(NDS_SCREEN_WIDTH) && console.y < float(NDS_SCREEN_HEIGHT);
++        }
++
+         [[nodiscard]] glm::ivec2 TransformPointerInput(int16_t x, int16_t y) const noexcept {
+             return TransformPointerInput(glm::i16vec2(x, y));
+         }
+@@ -269,6 +302,8 @@ namespace MelonDsDs {
+         [[nodiscard]] glm::uvec2 GetBottomScreenTranslation() const noexcept { return bottomScreenTranslation; }
+         [[nodiscard]] glm::uvec2 GetHybridScreenTranslation() const noexcept { return hybridScreenTranslation; }
+     private:
++        void ApplyCustomLayoutValue(std::string_view value) noexcept;
++        void UpdateCustomLayout() noexcept;
+         glm::mat3 GetTopScreenMatrix(unsigned scale) const noexcept;
+         glm::mat3 GetBottomScreenMatrix(unsigned scale) const noexcept;
+         glm::mat3 GetHybridScreenMatrix(unsigned scale) const noexcept;
+@@ -303,6 +338,11 @@ namespace MelonDsDs {
+         glm::uvec2 hybridScreenTranslation;
+ 
+         glm::uvec2 bufferSize;
++
++        // Gamuroid protocol P1 (gamuroid_screen_layout); all per session.
++        std::optional<gamuroid::CustomScreenLayout> _customLayout = std::nullopt;
++        glm::uvec2 _customMaxSize {0, 0};
++        std::string _lastInvalidLayoutValue {};
+     };
+ 
+     constexpr bool LayoutSupportsScreenGap(ScreenLayout layout) noexcept {
